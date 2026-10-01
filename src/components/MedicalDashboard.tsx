@@ -16,6 +16,7 @@ import UsbBackup from './UsbBackup';
 
 interface PatientRecord {
   id: string;
+  databaseId: string;
   name: string;
   dateOfBirth?: string;
   allergies: string[];
@@ -33,27 +34,38 @@ export default function MedicalDashboard() {
   const [error, setError] = useState('');
   const [activeForm, setActiveForm] = useState<ActiveForm>('none');
 
-  const handleSearch = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!patientIdInput.trim()) {
-      setError('Enter a patient ID or search term first.');
-      return;
-    }
+  const loadPatient = async (searchTerm: string) => {
     setError('');
     setLoading(true);
     try {
-      const result = await apiService.request<PatientRecord>('patient:get-by-id', patientIdInput.trim());
-      setPatient(result);
+      const result = await apiService.request<{ success: boolean; patient?: PatientRecord; error?: string }>(
+        'patient:get-by-id',
+        searchTerm,
+      );
+      if (!result?.success || !result.patient) {
+        throw new Error(result?.error || 'No matching patient was found.');
+      }
+      setPatient(result.patient);
       setActiveForm('none');
       await apiService.request('audit:log-event', {
         userId: user?.userId,
         action: 'PATIENT_RECORD_VIEWED',
       });
-    } catch {
-      setError("Couldn't load that patient record. Check the ID and try again.");
+    } catch (loadError) {
+      setPatient(null);
+      setError(loadError instanceof Error ? loadError.message : "Couldn't load that patient record.");
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!patientIdInput.trim()) {
+      setError('Enter a patient ID or full name first.');
+      return;
+    }
+    await loadPatient(patientIdInput);
   };
 
   return (
@@ -100,8 +112,8 @@ export default function MedicalDashboard() {
                     type="text"
                     value={patientIdInput}
                     onChange={(e) => setPatientIdInput(e.target.value)}
-                    placeholder="Search by patient ID (e.g. CAMPER-001)"
-                    aria-label="Search for a patient by ID"
+                    placeholder="Search by patient ID or full name"
+                    aria-label="Search for a patient by ID or full name"
                     className="w-full rounded border border-slate-300 bg-white py-2.5 pl-9 pr-3 text-sm text-ink placeholder:text-slate-500"
                   />
                 </div>
@@ -158,9 +170,9 @@ export default function MedicalDashboard() {
         {activeForm === 'new-patient' && (
           <NewPatientProfile
             onCancel={() => setActiveForm('none')}
-            onSaved={(id) => {
-              setActiveForm('none');
+            onSaved={async (id) => {
               setPatientIdInput(id);
+              await loadPatient(id);
             }}
           />
         )}

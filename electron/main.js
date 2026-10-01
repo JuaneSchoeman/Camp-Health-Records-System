@@ -11,8 +11,11 @@ require('dotenv').config();
 const { openEncryptedDatabase } = require('./database/database');
 const { createAuditLogger, ACTION_TYPES } = require('./database/auditLog');
 const { insertPatient, logAuditEvent } = require('./services/dbController');
-const { verifyPassword } = require('./services/authService');
+const { verifyPassword, hashPassword } = require('./services/authService');
 const { exportOfflineBackup } = require('./services/syncService');
+const { importPatientsFromCsv } = require('./services/csvImportService');
+const { createPatientProfile } = require('./services/patientProfileService');
+const { findPatient } = require('./services/patientQueryService');
 const { listUsbDrives } = require('./services/usbDetection');
 const { handleIpcSafely } = require('./utils/errorHandler');
 
@@ -76,53 +79,6 @@ app.on('window-all-closed', () => {
 // IPC HANDLERS
 // ============================================================================
 
-// 1. USB Drive Detection
-ipcMain.handle('backup:list-drives', async () => {
-  try {
-    // Windows PowerShell command querying Win32_LogicalDisk for removable drives (DriveType = 2)
-    const command = `powershell "Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DriveType -eq 2 } | Select-Object DeviceID, VolumeName, FreeSpace | ConvertTo-Json"`;
-    const { stdout } = await execPromise(command);
-
-    if (!stdout.trim()) return [];
-
-    const parsed = JSON.parse(stdout);
-    const drivesList = Array.isArray(parsed) ? parsed : [parsed];
-
-    return drivesList.map((drive) => ({
-      driveLetter: drive.DeviceID,
-      label: drive.VolumeName || 'Removable Disk',
-      freeSpaceGb: drive.FreeSpace ? parseFloat((drive.FreeSpace / (1024 ** 3)).toFixed(2)) : 0,
-    }));
-  } catch (error) {
-    console.error('[Backend Backup] Failed to list USB drives:', error.message);
-    return [];
-  }
-});
-
-// 2. USB Backup Execution
-ipcMain.handle('backup:start', async (event, { driveLetter, folderName, initiatedByUserId }) => {
-  try {
-    const destinationFolder = path.join(`${driveLetter}\\`, folderName);
-
-    if (!fs.existsSync(destinationFolder)) {
-      fs.mkdirSync(destinationFolder, { recursive: true });
-    }
-
-    const sourceDbPath = path.join(app.getPath('userData'), 'chrs.db');
-    const destDbPath = path.join(destinationFolder, 'chrs_backup.db');
-
-    if (fs.existsSync(sourceDbPath)) {
-      fs.copyFileSync(sourceDbPath, destDbPath);
-    }
-
-    console.log(`[Backend Backup] Created backup at: ${destinationFolder}`);
-    return { success: true, folderPath: destinationFolder };
-  } catch (error) {
-    console.error('[Backend Backup] Backup failed:', error.message);
-    throw new Error(`Backup execution failed: ${error.message}`);
-  }
-});
-
 // 1. Authentication Endpoint
 ipcMain.handle('auth:login', async (event, { username, password }) => {
   console.log(`[Backend Auth] Login attempt for user: ${username}`);
@@ -136,12 +92,33 @@ ipcMain.handle('auth:login', async (event, { username, password }) => {
   const role = roleByUsername[username?.toLowerCase()];
 
   if (role && password === 'password123') {
-    const userId = `usr-${username.toLowerCase()}-01`;
+    const normalizedUsername = username.toLowerCase();
+    const databaseRoleByUsername = {
+      admin: 'camp_administrator',
+      nurse: 'camp_nurse',
+      physician: 'camp_physician',
+    };
+    const db = getDb();
+    if (db && databaseRoleByUsername[normalizedUsername]) {
+      const existingUser = db.prepare('SELECT id, is_active FROM users WHERE username = ?').get(normalizedUsername);
+      if (existingUser && !existingUser.is_active) {
+        return { success: false, message: 'This account is disabled.' };
+      }
+      if (!existingUser) {
+        const passwordHash = await hashPassword(password);
+        db.prepare(`
+          INSERT INTO users (username, password_hash, role, full_name)
+          VALUES (?, ?, ?, ?)
+        `).run(normalizedUsername, passwordHash, databaseRoleByUsername[normalizedUsername], normalizedUsername);
+      }
+    }
+
+    const userId = `usr-${normalizedUsername}-01`;
     const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
     const payload = Buffer.from(
       JSON.stringify({
         userId,
-        username: username.toLowerCase(),
+        username: normalizedUsername,
         role,
         exp: Math.floor(Date.now() / 1000) + 60 * 60 * 8, // 8 hours
       })
@@ -157,7 +134,7 @@ ipcMain.handle('auth:login', async (event, { username, password }) => {
     return {
       success: true,
       token: jwtToken,
-      user: { userId, username: username.toLowerCase(), role },
+      user: { userId, username: normalizedUsername, role },
     };
   }
 
@@ -165,57 +142,64 @@ ipcMain.handle('auth:login', async (event, { username, password }) => {
 });
 
 // 2. Tamper-Evident Audit Logging
-//
-// Writes a real, hash-chained row to audit_log (see electron/database/auditLog.js)
-// instead of just logging to the console. Accepts either the free-text
-// `action` label the existing UI components already send (e.g.
-// 'USER_LOGIN', 'BACKUP_COMPLETED') or a proper `actionType` +
-// `targetTable` pair for callers that have one.
 handleIpcSafely(ipcMain, 'audit:log-event', getDb, async (event, logData = {}) => {
   if (!auditLog) throw new Error('Audit log is not available: database failed to initialize.');
 
-  const entry = auditLog.logEvent({
-    userId: logData.userId ?? null,
-    action: logData.action ?? null,
-    actionType: logData.actionType ?? null,
-    targetTable: logData.targetTable ?? 'system',
-    targetId: logData.targetId ?? null,
-    beforeImage: logData.beforeImage ?? null,
-    afterImage: logData.afterImage ?? null,
-    viewDurationMs: logData.viewDurationMs ?? null,
-    details: logData.details ?? null,
-  });
+  try {
+    const entry = auditLog.logEvent({
+      userId: logData.userId ?? null,
+      action: logData.action ?? null,
+      actionType: logData.actionType ?? null,
+      targetTable: logData.targetTable ?? 'system',
+      targetId: logData.targetId ?? null,
+      beforeImage: logData.beforeImage ?? null,
+      afterImage: logData.afterImage ?? null,
+      viewDurationMs: logData.viewDurationMs ?? null,
+      details: logData.details ?? null,
+    });
 
-  return { success: true, id: entry.id, hash: entry.entryHash };
+    return { success: true, id: entry.id, hash: entry.entryHash };
+  } catch (err) {
+    console.warn('[Audit Log Warning] Could not record log event:', err.message);
+    return { success: false, error: err.message };
+  }
 });
 
-// Reads back audit_log entries for the Audit Log Viewer, with optional
-// filters by date range, user, action type, and target (e.g. a patient id).
-// Restricted to VIEW_AUDIT_LOGS in the renderer via ProtectedView; the
-// handler itself doesn't re-check role because the renderer has no direct
-// DB access to fall back on if it did try to bypass that.
+// Read audit log entries
 handleIpcSafely(ipcMain, 'audit:get-entries', getDb, async (event, filters = {}) => {
   if (!auditLog) throw new Error('Audit log is not available: database failed to initialize.');
   return auditLog.getEntries(filters);
 });
 
-// Walks the full hash chain and reports whether it's intact — surfaced in
-// the Audit Log Viewer as an integrity check the Physician can run anytime.
+// Verify audit chain integrity
 handleIpcSafely(ipcMain, 'audit:verify-chain', getDb, async () => {
   if (!auditLog) throw new Error('Audit log is not available: database failed to initialize.');
   return auditLog.verifyChain();
 });
 
-// 5. Clinical Records Queries
-ipcMain.handle('patient:get-by-id', async (event, patientId) => {
-  console.log(`[Backend DB] Fetching record for Patient ID: ${patientId}`);
-  return {
-    success: true,
-    patientId: patientId,
-  };
+// Import a camper roster and audit each patient insert in the same transaction.
+handleIpcSafely(ipcMain, 'patient:import-csv', getDb, async (event, importData = {}) => {
+  const db = getDb();
+  if (!db) throw new Error('Database is not available.');
+  return importPatientsFromCsv(db, importData);
 });
 
-// 4. USB Backup (FR-08)
+// Create a patient profile and its audit entry atomically.
+handleIpcSafely(ipcMain, 'patient:create', getDb, async (event, profile = {}) => {
+  const db = getDb();
+  if (!db) throw new Error('Database is not available.');
+  return createPatientProfile(db, profile);
+});
+
+// 3. Clinical Records Queries
+handleIpcSafely(ipcMain, 'patient:get-by-id', getDb, async (event, searchTerm) => {
+  const db = getDb();
+  if (!db) throw new Error('Database is not available.');
+  console.log(`[Backend DB] Searching for patient: ${searchTerm}`);
+  return findPatient(db, searchTerm);
+});
+
+// 4. USB Backup
 handleIpcSafely(ipcMain, 'backup:list-drives', getDb, async () => {
   return listUsbDrives();
 });
@@ -227,12 +211,18 @@ handleIpcSafely(ipcMain, 'backup:start', getDb, async (event, { driveLetter, fol
 
   const result = await exportOfflineBackup(db, dbFilePath, driveLetter, folderName, initiatedByUserId);
 
-  auditLog.logEvent({
-    userId: initiatedByUserId ?? null,
-    actionType: 'EXPORT',
-    targetTable: 'backup_log',
-    details: `USB backup written to ${driveLetter}${result.folderName}, sha256=${result.hash}`,
-  });
+  if (auditLog) {
+    try {
+      auditLog.logEvent({
+        userId: initiatedByUserId ?? null,
+        actionType: 'EXPORT',
+        targetTable: 'backup_log',
+        details: `USB backup written to ${driveLetter}${result.folderName}, sha256=${result.hash}`,
+      });
+    } catch (err) {
+      console.warn('[Audit Log Warning] Could not log backup event:', err.message);
+    }
+  }
 
   return result;
 });

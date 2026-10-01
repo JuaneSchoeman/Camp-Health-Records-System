@@ -36,8 +36,6 @@ import SignaturePad from './SignaturePad';
  * - The 5-year vs. 10-year retention conflict between the client Q&A
  *   and the FSD
  *
- * NOTE: calls apiService.request('patient:create', ...), still not a
- * real IPC handler.
  */
 
 interface NewPatientProfileProps {
@@ -193,7 +191,7 @@ export default function NewPatientProfile({ onSaved, onCancel }: NewPatientProfi
     setSaving(true);
 
     try {
-      const result = await apiService.request<{ id: string }>('patient:create', {
+      const result = await apiService.request<{ success: boolean; id?: string; error?: string }>('patient:create', {
         firstName, surname, dateOfBirth, sex, tShirtSize, address, cellNumber, languageSpoken,
         photoDataUrl, campSessionDate,
         caregiverName, caregiverCell,
@@ -211,15 +209,14 @@ export default function NewPatientProfile({ onSaved, onCancel }: NewPatientProfi
         },
         createdByUserId: user?.userId,
       });
-      await apiService.request('audit:log-event', {
-        userId: user?.userId,
-        action: 'PATIENT_PROFILE_CREATED',
-      });
+      if (!result?.success) throw new Error(result?.error || 'The patient profile could not be saved.');
       setNewPatientId(result?.id ?? '');
       setSaved(true);
       if (result?.id) onSaved?.(result.id);
-    } catch {
-      setErrors({ save: "Couldn't create this profile. Check the connection and try again." });
+    } catch (error) {
+      setErrors({
+        save: error instanceof Error ? error.message : "Couldn't create this profile. Check the connection and try again.",
+      });
     } finally {
       setSaving(false);
     }
