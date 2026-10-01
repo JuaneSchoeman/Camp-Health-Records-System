@@ -12,6 +12,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       'auth:login',
       'patient:get-by-id',
       'patient:save-record',
+      'patient:create',
+      'patient:import-csv',
       'audit:log-event',
       'audit:get-entries',
       'audit:verify-chain',

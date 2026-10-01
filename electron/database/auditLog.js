@@ -101,6 +101,8 @@ function sha256Hex(input) {
  */
 function createAuditLogger(db) {
     const getLastHashStmt = db.prepare(`SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1`);
+    const getUserStmt = db.prepare(`SELECT id FROM users WHERE id = ?`);
+    const getUserByUsernameStmt = db.prepare(`SELECT id FROM users WHERE username = ?`);
 
     const insertStmt = db.prepare(`
         INSERT INTO audit_log
@@ -136,7 +138,15 @@ function createAuditLogger(db) {
             throw new Error('auditLog.logEvent: targetTable is required');
         }
 
-        const { resolvedActionType, resolvedDetails } = resolveActionType(actionType, action, details);
+        const legacyUserMatch = typeof userId === 'string' ? /^usr-(.+)-01$/.exec(userId) : null;
+        const user = userId == null
+            ? null
+            : getUserStmt.get(userId) ?? (legacyUserMatch ? getUserByUsernameStmt.get(legacyUserMatch[1]) : null);
+        const resolvedUserId = user?.id ?? null;
+        const actorDetails = userId != null && !user
+            ? [details, `unresolved_user_id=${String(userId)}`].filter(Boolean).join('; ')
+            : details;
+        const { resolvedActionType, resolvedDetails } = resolveActionType(actionType, action, actorDetails);
         const eventTime = new Date().toISOString();
 
         const beforeImageStr = beforeImage != null && typeof beforeImage !== 'string' ? JSON.stringify(beforeImage) : beforeImage;
@@ -145,7 +155,7 @@ function createAuditLogger(db) {
         const prevHash = getLastHashStmt.get()?.entry_hash ?? null;
         const rowForHash = {
             eventTime,
-            userId,
+            userId: resolvedUserId,
             actionType: resolvedActionType,
             targetTable,
             targetId,
@@ -158,7 +168,7 @@ function createAuditLogger(db) {
 
         const info = insertStmt.run({
             eventTime,
-            userId,
+            userId: resolvedUserId,
             actionType: resolvedActionType,
             targetTable,
             targetId,
